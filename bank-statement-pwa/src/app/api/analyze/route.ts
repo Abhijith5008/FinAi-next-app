@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
+import { googleVisionOcrFromImageBase64 } from "@/lib/ocr/google-vision-rest";
 
 export const runtime = "nodejs";
 
@@ -16,6 +17,7 @@ type Txn = {
     date: string;
     description: string;
     amount: number;
+    drCr?: "CR" | "DR";
     currency: string;
     category: string;
     confidence: number;
@@ -35,7 +37,23 @@ type AnalyzeMeta = {
     note?: string;
 };
 
-type ApiOk = { ok: true; txns: Txn[]; meta: AnalyzeMeta };
+type Insights = {
+    transactionCount: number;
+    totalDebits: number;
+    totalCredits: number;
+    netFlow: number;
+    incomeExpenseRatio: number | null;
+    avgDebit: number;
+    avgCredit: number;
+    categoryBreakdown: Array<{ category: string; count: number; total: number }>;
+    monthOverMonth: Array<{ month: string; income: number; expense: number; net: number }>;
+    subscriptions: Array<{ merchant: string; count: number; avgAmount: number; totalAmount: number }>;
+    unusualSpends: Array<{ id: string; date: string; description: string; amount: number }>;
+    topExpense?: { description: string; amount: number };
+    topCredit?: { description: string; amount: number };
+};
+
+type ApiOk = { ok: true; txns: Txn[]; meta: AnalyzeMeta; insights: Insights };
 type ApiFail = { ok: false; message: string; needsPassword?: boolean };
 type ApiResponse = ApiOk | ApiFail;
 type ParsedRow = {
@@ -44,9 +62,19 @@ type ParsedRow = {
     particulars: string;
     withdrawal?: number;
     deposit?: number;
+    txnAmount?: number;
     balance?: number;
     balanceType?: "DR" | "CR";
 };
+
+type PositionedToken = {
+    str: string;
+    x: number;
+    y: number;
+};
+
+const DATE_TOKEN =
+    "(?:\\d{1,2}[./-]\\d{1,2}[./-]\\d{2,4}|\\d{1,2}\\s+[A-Za-z]{3}\\s+\\d{2,4}|\\d{1,2}-[A-Za-z]{3}-\\d{2,4})";
 
 function fileTypeOf(file: File): FileType {
     const name = file.name.toLowerCase();
@@ -98,7 +126,44 @@ function toPasswordFail(err: unknown): ApiFail | null {
     };
 }
 
-// Extract visible text from first N pages (cheap + good for text PDFs)
+function normalizeAmountToken(raw: string): string {
+    return raw.replace(/[^\d,.-]/g, "").replace(/,/g, "").trim();
+}
+
+function textFromPageContent(content: Awaited<ReturnType<pdfjsLib.PDFPageProxy["getTextContent"]>>): string {
+    const tokens: PositionedToken[] = [];
+
+    for (const item of content.items) {
+        if (!("str" in item) || !("transform" in item)) continue;
+        const str = String(item.str).trim();
+        if (!str) continue;
+        const transform = item.transform as number[];
+        const x = Number(transform?.[4] ?? 0);
+        const y = Number(transform?.[5] ?? 0);
+        tokens.push({ str, x, y });
+    }
+
+    tokens.sort((a, b) => {
+        if (Math.abs(b.y - a.y) > 1.5) return b.y - a.y;
+        return a.x - b.x;
+    });
+
+    const rows: PositionedToken[][] = [];
+    for (const t of tokens) {
+        const last = rows[rows.length - 1];
+        if (!last || Math.abs(last[0].y - t.y) > 2.5) {
+            rows.push([t]);
+        } else {
+            last.push(t);
+        }
+    }
+
+    return rows
+        .map((row) => row.sort((a, b) => a.x - b.x).map((t) => t.str).join(" "))
+        .join("\n");
+}
+
+// Extract visible text using x/y grouping, which is more reliable for table PDFs.
 async function extractPdfText(doc: pdfjsLib.PDFDocumentProxy, maxPages: number) {
     const pages = Math.min(doc.numPages, maxPages);
     let text = "";
@@ -106,14 +171,60 @@ async function extractPdfText(doc: pdfjsLib.PDFDocumentProxy, maxPages: number) 
     for (let i = 1; i <= pages; i++) {
         const page = await doc.getPage(i);
         const content = await page.getTextContent();
-        // Preserve line boundaries; flat spaces make table parsing unreliable.
-        let pageText = "";
-        for (const it of content.items) {
-            if (!("str" in it)) continue;
-            pageText += String(it.str);
-            pageText += "hasEOL" in it && it.hasEOL ? "\n" : " ";
-        }
+        const pageText = textFromPageContent(content);
         text += pageText + "\n";
+    }
+
+    return text.trim();
+}
+
+async function ocrPdfPages(doc: pdfjsLib.PDFDocumentProxy, maxPages: number): Promise<string> {
+    if (!process.env.GOOGLE_VISION_API_KEY) return "";
+
+    const pages = Math.min(doc.numPages, maxPages);
+    let text = "";
+
+    // Lazy-load native canvas only when OCR is required.
+    let canvasMod: {
+        createCanvas: (width: number, height: number) => {
+            getContext: (type: "2d") => unknown;
+            toBuffer: (mimeType?: string) => Buffer;
+        };
+    };
+    try {
+        canvasMod = (await import("@napi-rs/canvas")) as unknown as {
+            createCanvas: (width: number, height: number) => {
+                getContext: (type: "2d") => unknown;
+                toBuffer: (mimeType?: string) => Buffer;
+            };
+        };
+    } catch {
+        // Native binding missing in this environment. Skip OCR fallback.
+        return "";
+    }
+
+    for (let i = 1; i <= pages; i++) {
+        const page = await doc.getPage(i);
+        const viewport = page.getViewport({ scale: 2.0 });
+        const canvas = canvasMod.createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+        const canvasContext = canvas.getContext("2d");
+
+        try {
+            await page.render({
+                canvasContext: canvasContext as CanvasRenderingContext2D,
+                canvas: canvas as unknown as HTMLCanvasElement,
+                viewport,
+            }).promise;
+        } catch {
+            // If rendering fails for a page, continue with next page.
+            continue;
+        }
+
+        const png = canvas.toBuffer("image/png");
+        const { text: pageText } = await googleVisionOcrFromImageBase64({
+            base64: png.toString("base64"),
+        });
+        text += `${pageText}\n`;
     }
 
     return text.trim();
@@ -121,34 +232,62 @@ async function extractPdfText(doc: pdfjsLib.PDFDocumentProxy, maxPages: number) 
 
 function looksLikeHeader(line: string): boolean {
     const l = line.toLowerCase().replace(/\s+/g, " ").trim();
-    return (
-        l.includes("date") &&
-        l.includes("value date") &&
-        l.includes("particular") &&
-        l.includes("withdraw") &&
-        l.includes("deposit") &&
-        l.includes("balance")
-    );
+    const hasDateCols =
+        (l.includes("date") && l.includes("value date")) ||
+        l.includes("transaction date");
+    const hasDescCol = l.includes("particular") || l.includes("remarks") || l.includes("transaction remarks");
+    return hasDateCols && hasDescCol && l.includes("withdraw") && l.includes("deposit") && l.includes("balance");
 }
 
 function parseAmountToken(token: string): number | null {
-    const normalized = token.replace(/,/g, "").trim();
+    const normalized = normalizeAmountToken(token);
     if (!/^\d+(?:\.\d{1,2})?$/.test(normalized)) return null;
     const n = Number(normalized);
     return Number.isFinite(n) ? n : null;
 }
 
 function toIsoDate(d: string): string {
-    const m = d.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
-    if (!m) return d;
-    const dd = m[1].padStart(2, "0");
-    const mm = m[2].padStart(2, "0");
-    let yyyy = m[3];
-    if (yyyy.length === 2) {
-        const y = Number(yyyy);
-        yyyy = String(y >= 70 ? 1900 + y : 2000 + y);
+    const slash = d.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
+    if (slash) {
+        const dd = slash[1].padStart(2, "0");
+        const mm = slash[2].padStart(2, "0");
+        let yyyy = slash[3];
+        if (yyyy.length === 2) {
+            const y = Number(yyyy);
+            yyyy = String(y >= 70 ? 1900 + y : 2000 + y);
+        }
+        return `${yyyy}-${mm}-${dd}`;
     }
-    return `${yyyy}-${mm}-${dd}`;
+
+    const monthName = d.match(/^(\d{1,2})[\s-]([A-Za-z]{3})[\s-](\d{2,4})$/);
+    if (monthName) {
+        const dd = monthName[1].padStart(2, "0");
+        const mmm = monthName[2].toLowerCase();
+        const monthMap: Record<string, string> = {
+            jan: "01",
+            feb: "02",
+            mar: "03",
+            apr: "04",
+            may: "05",
+            jun: "06",
+            jul: "07",
+            aug: "08",
+            sep: "09",
+            oct: "10",
+            nov: "11",
+            dec: "12",
+        };
+        const mm = monthMap[mmm];
+        if (!mm) return d;
+        let yyyy = monthName[3];
+        if (yyyy.length === 2) {
+            const y = Number(yyyy);
+            yyyy = String(y >= 70 ? 1900 + y : 2000 + y);
+        }
+        return `${yyyy}-${mm}-${dd}`;
+    }
+
+    return d;
 }
 
 function inferCategory(text: string): string {
@@ -179,52 +318,44 @@ function parseStatementRows(text: string): ParsedRow[] {
         }
         if (!inTable) continue;
 
-        const txStart = line.match(/^(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+(.*)$/);
+        const txStart = line.match(new RegExp(`^(?:\\d+\\s+)?(${DATE_TOKEN})(?:\\s+(${DATE_TOKEN}))?\\s+(.*)$`));
         if (txStart) {
             if (current) rows.push(current);
 
             const [, dateRaw, valueDateRaw, restRaw] = txStart;
+            // Money columns in statements are decimal; avoid picking up IDs/refs.
+            const amountMatches = Array.from(restRaw.matchAll(/-?\d[\d,]*(?:\.\d{1,2})/g));
+            const amountValues = amountMatches.map((m) => parseAmountToken(m[0])).filter((n): n is number => n !== null);
+            const lastThree = amountValues.slice(-3);
+
+            const firstTailIndex =
+                amountMatches.length >= 3
+                    ? (amountMatches[amountMatches.length - 3].index ?? restRaw.length)
+                    : amountMatches.length >= 2
+                      ? (amountMatches[amountMatches.length - 2].index ?? restRaw.length)
+                      : amountMatches.length >= 1
+                        ? (amountMatches[amountMatches.length - 1].index ?? restRaw.length)
+                        : restRaw.length;
+
+            const particulars = restRaw.slice(0, firstTailIndex).replace(/\s+/g, " ").trim();
             const tokens = restRaw.split(" ").filter(Boolean);
 
             let balanceType: "DR" | "CR" | undefined;
             if (tokens.length > 0 && /^(DR|CR)$/i.test(tokens[tokens.length - 1])) {
                 balanceType = tokens.pop()!.toUpperCase() as "DR" | "CR";
-            }
-
-            let balance: number | undefined;
-            if (tokens.length > 0) {
-                const v = parseAmountToken(tokens[tokens.length - 1]);
-                if (v !== null) {
-                    balance = v;
-                    tokens.pop();
-                }
-            }
-
-            let deposit: number | undefined;
-            if (tokens.length > 0) {
-                const v = parseAmountToken(tokens[tokens.length - 1]);
-                if (v !== null) {
-                    deposit = v;
-                    tokens.pop();
-                }
-            }
-
-            let withdrawal: number | undefined;
-            if (tokens.length > 0) {
-                const v = parseAmountToken(tokens[tokens.length - 1]);
-                if (v !== null) {
-                    withdrawal = v;
-                    tokens.pop();
-                }
+            } else {
+                const crdr = restRaw.match(/\b(DR|CR)\b/i);
+                if (crdr) balanceType = crdr[1].toUpperCase() as "DR" | "CR";
             }
 
             current = {
                 date: toIsoDate(dateRaw),
-                valueDate: toIsoDate(valueDateRaw),
-                particulars: tokens.join(" ").trim(),
-                withdrawal,
-                deposit,
-                balance,
+                valueDate: valueDateRaw ? toIsoDate(valueDateRaw) : undefined,
+                particulars,
+                withdrawal: lastThree.length === 3 ? lastThree[0] : undefined,
+                deposit: lastThree.length === 3 ? lastThree[1] : undefined,
+                txnAmount: lastThree.length === 2 ? lastThree[0] : undefined,
+                balance: lastThree.length > 0 ? lastThree[lastThree.length - 1] : undefined,
                 balanceType,
             };
             continue;
@@ -241,25 +372,214 @@ function parseStatementRows(text: string): ParsedRow[] {
 }
 
 function toTxns(rows: ParsedRow[]): Txn[] {
-    return rows.map((r, i) => {
+    const txns: Txn[] = [];
+    let prevBalance: number | null = null;
+
+    for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        const particularsLower = r.particulars.toLowerCase();
+        const isOpeningBalance = particularsLower.includes("opening balance");
+
         const hasDeposit = typeof r.deposit === "number" && r.deposit > 0;
         const hasWithdrawal = typeof r.withdrawal === "number" && r.withdrawal > 0;
 
         let amount = 0;
-        if (hasDeposit) amount = r.deposit!;
+        if (hasDeposit && hasWithdrawal) amount = r.deposit! - r.withdrawal!;
+        else if (hasDeposit) amount = r.deposit!;
         else if (hasWithdrawal) amount = -r.withdrawal!;
-        else if (typeof r.balance === "number") amount = r.balanceType === "CR" ? r.balance : -r.balance;
+        else if (typeof r.balance === "number" && typeof prevBalance === "number") amount = r.balance - prevBalance;
+        else if (typeof r.txnAmount === "number") {
+            const isCreditHint = /(salary|interest|refund|credit|cr\b|deposit|cashback|received)/i.test(r.particulars);
+            amount = isCreditHint ? Math.abs(r.txnAmount) : -Math.abs(r.txnAmount);
+        } else if (typeof r.balance === "number") {
+            // Last fallback; may be noisy if opening balance lines leak through.
+            amount = r.balanceType === "CR" ? Math.abs(r.balance) : -Math.abs(r.balance);
+        }
 
-        return {
+        if (typeof r.balance === "number") {
+            prevBalance = r.balanceType === "DR" ? -Math.abs(r.balance) : Math.abs(r.balance);
+        }
+
+        if (isOpeningBalance) {
+            continue;
+        }
+
+        txns.push({
             id: `${r.date}-${i + 1}`,
             date: r.date,
             description: r.particulars,
             amount,
+            drCr: amount >= 0 ? "CR" : "DR",
             currency: "INR",
             category: inferCategory(r.particulars),
             confidence: hasDeposit || hasWithdrawal ? 0.82 : 0.62,
-        };
-    });
+        });
+    }
+
+    return txns;
+}
+
+function parseTransactionsFromText(text: string): Txn[] {
+    const primary = toTxns(parseStatementRows(text));
+    if (primary.length > 0) return primary;
+
+    // Fallback parser for statements where headers/columns are broken.
+    const lines = text
+        .split(/\r?\n/)
+        .map((l) => l.replace(/\s+/g, " ").trim())
+        .filter(Boolean);
+    const txns: Txn[] = [];
+
+    for (const line of lines) {
+        const m = line.match(
+            new RegExp(`^(?:\\d+\\s+)?(${DATE_TOKEN})\\s+(?:${DATE_TOKEN}\\s+)?(.+?)\\s+(-?\\d[\\d,]*(?:\\.\\d{1,2})?)\\s*$`)
+        );
+        if (!m) continue;
+
+        const date = toIsoDate(m[1]);
+        const description = m[2].trim();
+        const amount = parseAmountToken(m[3]);
+        if (amount === null) continue;
+
+        txns.push({
+            id: `${date}-fallback-${txns.length + 1}`,
+            date,
+            description,
+            amount: /cr(ed)?it|deposit|salary|interest|refund/i.test(description) ? amount : -amount,
+            drCr: /cr(ed)?it|deposit|salary|interest|refund/i.test(description) ? "CR" : "DR",
+            currency: "INR",
+            category: inferCategory(description),
+            confidence: 0.55,
+        });
+    }
+
+    return txns;
+}
+
+function monthKey(dateIso: string): string | null {
+    const m = dateIso.match(/^(\d{4})-(\d{2})-\d{2}$/);
+    if (!m) return null;
+    return `${m[1]}-${m[2]}`;
+}
+
+function normalizeMerchant(description: string): string {
+    return description
+        .toUpperCase()
+        .replace(/\b(UPI|IMPS|NEFT|RTGS|POS|ATM|TO|BY|TRANSFER|PAYMENT|DEBIT|CREDIT|REF|TXN|ID)\b/g, " ")
+        .replace(/[0-9#*._/-]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function buildInsights(txns: Txn[]): Insights {
+    const debits = txns.filter((t) => (t.drCr ? t.drCr === "DR" : t.amount < 0));
+    const credits = txns.filter((t) => (t.drCr ? t.drCr === "CR" : t.amount > 0));
+
+    const totalDebits = debits.reduce((sum, t) => sum + Math.abs(t.amount), 0);
+    const totalCredits = credits.reduce((sum, t) => sum + Math.abs(t.amount), 0);
+    const topExpenseTxn = debits.reduce<Txn | null>((best, t) => {
+        if (!best) return t;
+        return Math.abs(t.amount) > Math.abs(best.amount) ? t : best;
+    }, null);
+    const topCreditTxn = credits.reduce<Txn | null>((best, t) => {
+        if (!best) return t;
+        return t.amount > best.amount ? t : best;
+    }, null);
+
+    const categoryMap = new Map<string, { count: number; total: number }>();
+    for (const t of txns) {
+        const entry = categoryMap.get(t.category) ?? { count: 0, total: 0 };
+        entry.count += 1;
+        entry.total += Math.abs(t.amount);
+        categoryMap.set(t.category, entry);
+    }
+    const categoryBreakdown = Array.from(categoryMap.entries())
+        .map(([category, v]) => ({ category, count: v.count, total: v.total }))
+        .sort((a, b) => b.total - a.total);
+
+    const monthMap = new Map<string, { income: number; expense: number }>();
+    for (const t of txns) {
+        const mk = monthKey(t.date);
+        if (!mk) continue;
+        const entry = monthMap.get(mk) ?? { income: 0, expense: 0 };
+        const type = t.drCr ?? (t.amount >= 0 ? "CR" : "DR");
+        if (type === "CR") entry.income += Math.abs(t.amount);
+        else entry.expense += Math.abs(t.amount);
+        monthMap.set(mk, entry);
+    }
+    const monthOverMonth = Array.from(monthMap.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([month, v]) => ({ month, income: v.income, expense: v.expense, net: v.income - v.expense }));
+
+    const merchantGroups = new Map<string, Txn[]>();
+    for (const t of debits) {
+        const merchant = normalizeMerchant(t.description);
+        if (!merchant || merchant.length < 3) continue;
+        const arr = merchantGroups.get(merchant) ?? [];
+        arr.push(t);
+        merchantGroups.set(merchant, arr);
+    }
+    const subscriptions = Array.from(merchantGroups.entries())
+        .map(([merchant, list]) => {
+            const months = new Set(list.map((t) => monthKey(t.date)).filter(Boolean));
+            const total = list.reduce((s, t) => s + Math.abs(t.amount), 0);
+            const avg = total / list.length;
+            return {
+                merchant,
+                count: list.length,
+                monthCount: months.size,
+                avgAmount: avg,
+                totalAmount: total,
+            };
+        })
+        .filter((g) => g.count >= 2 && g.monthCount >= 2)
+        .sort((a, b) => b.totalAmount - a.totalAmount)
+        .slice(0, 10)
+        .map((g) => ({
+            merchant: g.merchant,
+            count: g.count,
+            avgAmount: g.avgAmount,
+            totalAmount: g.totalAmount,
+        }));
+
+    const debitAbs = debits.map((t) => Math.abs(t.amount));
+    const mean = debitAbs.length ? debitAbs.reduce((a, b) => a + b, 0) / debitAbs.length : 0;
+    const variance =
+        debitAbs.length > 1
+            ? debitAbs.reduce((s, v) => s + (v - mean) * (v - mean), 0) / debitAbs.length
+            : 0;
+    const stdDev = Math.sqrt(variance);
+    const unusualThreshold = Math.max(mean * 1.8, mean + 2 * stdDev);
+    const unusualSpends = debits
+        .filter((t) => Math.abs(t.amount) > unusualThreshold && Math.abs(t.amount) > 1000)
+        .sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount))
+        .slice(0, 10)
+        .map((t) => ({
+            id: t.id,
+            date: t.date,
+            description: t.description,
+            amount: Math.abs(t.amount),
+        }));
+
+    const incomeExpenseRatio = totalDebits > 0 ? totalCredits / totalDebits : null;
+
+    return {
+        transactionCount: txns.length,
+        totalDebits,
+        totalCredits,
+        netFlow: totalCredits - totalDebits,
+        incomeExpenseRatio,
+        avgDebit: debits.length ? totalDebits / debits.length : 0,
+        avgCredit: credits.length ? totalCredits / credits.length : 0,
+        categoryBreakdown,
+        monthOverMonth,
+        subscriptions,
+        unusualSpends,
+        topExpense: topExpenseTxn
+            ? { description: topExpenseTxn.description, amount: Math.abs(topExpenseTxn.amount) }
+            : undefined,
+        topCredit: topCreditTxn ? { description: topCreditTxn.description, amount: topCreditTxn.amount } : undefined,
+    };
 }
 
 export async function POST(req: Request) {
@@ -321,11 +641,19 @@ export async function POST(req: Request) {
                 // Parse all pages for transaction extraction.
                 const text = await extractPdfText(doc, doc.numPages);
                 const extractedTextChars = text.length;
-                const parsedRows = parseStatementRows(text);
-                const txns = toTxns(parsedRows);
+                let txns = parseTransactionsFromText(text);
 
                 // Heuristic: if very little text, likely scanned => needs OCR pipeline
                 const looksScanned = extractedTextChars < 50;
+                let ocrChars = 0;
+
+                // OCR fallback for scanned PDFs or when parser found no rows in text layer.
+                if ((looksScanned || txns.length === 0) && process.env.GOOGLE_VISION_API_KEY) {
+                    const ocrText = await ocrPdfPages(doc, Math.min(doc.numPages, 5));
+                    ocrChars = ocrText.length;
+                    const ocrTxns = parseTransactionsFromText(ocrText);
+                    if (ocrTxns.length > txns.length) txns = ocrTxns;
+                }
 
                 const meta: AnalyzeMeta = {
                     fileType: "pdf",
@@ -334,11 +662,18 @@ export async function POST(req: Request) {
                     extractedTextChars,
                     requiresOcr: looksScanned,
                     note: looksScanned
-                        ? "Scanned/ image-based PDF detected. Needs OCR (PDF pages must be converted to images first)."
-                        : `Text PDF detected. Parsed ${txns.length} transactions.`,
+                        ? ocrChars > 0
+                          ? `Scanned/ image-based PDF detected. OCR fallback processed ${Math.min(doc.numPages, 5)} pages.`
+                          : "Scanned/ image-based PDF detected. Configure GOOGLE_VISION_API_KEY to enable OCR fallback."
+                        : txns.length > 0
+                          ? `Text PDF detected. Parsed ${txns.length} transactions.`
+                          : ocrChars > 0
+                            ? "Text layer parsing failed; OCR fallback attempted."
+                            : "Text PDF detected but no transaction rows were matched. Statement format rules need tuning.",
                 };
+                const insights = buildInsights(txns);
 
-                const payload: ApiOk = { ok: true, txns, meta };
+                const payload: ApiOk = { ok: true, txns, meta, insights };
                 return NextResponse.json<ApiResponse>(payload);
             } catch (err: unknown) {
                 // If err is our ApiFail object
@@ -365,6 +700,7 @@ export async function POST(req: Request) {
             return NextResponse.json<ApiResponse>({
                 ok: true,
                 txns: [],
+                insights: buildInsights([]),
                 meta: { fileType: "csv", note: "MVP: CSV parsing next." },
             });
         }
@@ -374,6 +710,7 @@ export async function POST(req: Request) {
             return NextResponse.json<ApiResponse>({
                 ok: true,
                 txns: [],
+                insights: buildInsights([]),
                 meta: {
                     fileType: "image",
                     note: "MVP: Image OCR next (Google Vision API key works here directly).",

@@ -1,55 +1,19 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import Modal from "@/components/modal";
+import type { AnalyzeResponse } from "@/lib/types/analyze";
 
-type FileType = "pdf" | "csv" | "image" | "unknown";
-
-export type Txn = {
-  id: string;
-  date: string; // ISO yyyy-mm-dd
-  description: string;
-  amount: number; // +income, -expense
-  currency: string;
-  category: string;
-  confidence: number; // 0..1
-  merchant?: string;
-  isSubscription?: boolean;
-};
-
-type AnalyzeMeta = {
-  fileType: FileType;
-  encrypted?: boolean;
-  pageCount?: number;
-  note?: string;
-};
-
-type AnalyzeOk = {
-  ok: true;
-  txns: Txn[];
-  meta: AnalyzeMeta;
-};
-
-type AnalyzeFail = {
-  ok: false;
-  message: string;
-  needsPassword?: boolean;
-};
-
-type AnalyzeResponse = AnalyzeOk | AnalyzeFail;
+const ANALYSIS_STORAGE_KEY = "statement_analysis_result_v1";
 
 export default function UploadStatement() {
+  const router = useRouter();
   const [file, setFile] = useState<File | null>(null);
-
-  // modal states
   const [passwordModalOpen, setPasswordModalOpen] = useState(false);
-  const [resultModalOpen, setResultModalOpen] = useState(false);
-
-  // data states
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string>("");
-  const [result, setResult] = useState<AnalyzeOk | null>(null);
+  const [error, setError] = useState("");
 
   const fileLabel = useMemo(() => {
     if (!file) return "No file selected";
@@ -61,9 +25,7 @@ export default function UploadStatement() {
     setPassword("");
     setBusy(false);
     setError("");
-    setResult(null);
     setPasswordModalOpen(false);
-    setResultModalOpen(false);
   };
 
   async function runAnalyze(opts?: { password?: string }) {
@@ -71,7 +33,6 @@ export default function UploadStatement() {
 
     setBusy(true);
     setError("");
-    setResult(null);
 
     try {
       const fd = new FormData();
@@ -83,18 +44,37 @@ export default function UploadStatement() {
 
       if (!data.ok) {
         setError(data.message);
-
-        if (data.needsPassword) {
-          setPasswordModalOpen(true);
-        }
-
+        if (data.needsPassword) setPasswordModalOpen(true);
         return;
       }
 
       setPasswordModalOpen(false);
       setPassword("");
-      setResult(data);
-      setResultModalOpen(true);
+
+      const payload = JSON.stringify({
+        ...data,
+        uploadedFileName: file.name,
+        uploadedAtIso: new Date().toISOString(),
+      });
+
+      try {
+        sessionStorage.setItem(ANALYSIS_STORAGE_KEY, payload);
+      } catch {
+        // Fall back below.
+      }
+      try {
+        localStorage.setItem(ANALYSIS_STORAGE_KEY, payload);
+      } catch {
+        // Continue; navigation fallback still runs.
+      }
+
+      router.push("/analysis");
+      router.refresh();
+      setTimeout(() => {
+        if (window.location.pathname !== "/analysis") {
+          window.location.assign("/analysis");
+        }
+      }, 120);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Something went wrong.";
       setError(msg);
@@ -116,9 +96,7 @@ export default function UploadStatement() {
             setFile(f);
             setPassword("");
             setError("");
-            setResult(null);
             setPasswordModalOpen(false);
-            setResultModalOpen(false);
           }}
         />
         <p className="text-xs text-slate-400">{fileLabel}</p>
@@ -148,7 +126,6 @@ export default function UploadStatement() {
         </div>
       )}
 
-      {/* Password Modal */}
       <Modal
         open={passwordModalOpen}
         title="Password required"
@@ -191,41 +168,7 @@ export default function UploadStatement() {
               Cancel
             </button>
           </div>
-
-          <p className="text-xs text-slate-400">
-            Tip: Common passwords are DOB, PAN, or last digits of phone/account.
-          </p>
         </div>
-      </Modal>
-
-      {/* Result Modal */}
-      <Modal
-        open={resultModalOpen}
-        title="Analysis result (MVP)"
-        onClose={() => setResultModalOpen(false)}
-      >
-        {!result ? (
-          <p className="text-sm text-slate-300">No result.</p>
-        ) : (
-          <div className="space-y-3">
-            <div className="text-xs text-slate-400">
-              Transactions: {result.txns.length}
-            </div>
-
-            <pre className="text-xs overflow-auto whitespace-pre-wrap rounded-lg border border-slate-800 bg-slate-900/40 p-3 text-slate-200">
-              {JSON.stringify(result.meta, null, 2)}
-            </pre>
-
-            <div className="flex justify-end">
-              <button
-                className="rounded-lg border border-slate-700 px-4 py-2 text-sm"
-                onClick={() => setResultModalOpen(false)}
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        )}
       </Modal>
     </section>
   );

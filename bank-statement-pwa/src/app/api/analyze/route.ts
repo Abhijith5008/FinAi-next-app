@@ -3,6 +3,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import { googleVisionOcrFromImageBase64 } from "@/lib/ocr/google-vision-rest";
+import { runParserPipeline } from "@/lib/parsers";
 
 export const runtime = "nodejs";
 
@@ -18,6 +19,7 @@ type Txn = {
     description: string;
     amount: number;
     drCr?: "CR" | "DR";
+    sourceParser?: string;
     currency: string;
     category: string;
     confidence: number;
@@ -420,40 +422,18 @@ function toTxns(rows: ParsedRow[]): Txn[] {
 }
 
 function parseTransactionsFromText(text: string): Txn[] {
-    const primary = toTxns(parseStatementRows(text));
-    if (primary.length > 0) return primary;
-
-    // Fallback parser for statements where headers/columns are broken.
-    const lines = text
-        .split(/\r?\n/)
-        .map((l) => l.replace(/\s+/g, " ").trim())
-        .filter(Boolean);
-    const txns: Txn[] = [];
-
-    for (const line of lines) {
-        const m = line.match(
-            new RegExp(`^(?:\\d+\\s+)?(${DATE_TOKEN})\\s+(?:${DATE_TOKEN}\\s+)?(.+?)\\s+(-?\\d[\\d,]*(?:\\.\\d{1,2})?)\\s*$`)
-        );
-        if (!m) continue;
-
-        const date = toIsoDate(m[1]);
-        const description = m[2].trim();
-        const amount = parseAmountToken(m[3]);
-        if (amount === null) continue;
-
-        txns.push({
-            id: `${date}-fallback-${txns.length + 1}`,
-            date,
-            description,
-            amount: /cr(ed)?it|deposit|salary|interest|refund/i.test(description) ? amount : -amount,
-            drCr: /cr(ed)?it|deposit|salary|interest|refund/i.test(description) ? "CR" : "DR",
-            currency: "INR",
-            category: inferCategory(description),
-            confidence: 0.55,
-        });
-    }
-
-    return txns;
+    const result = runParserPipeline(text);
+    return result.txns.map((t, i) => ({
+        id: `${t.date}-${result.parserId}-${i + 1}`,
+        date: t.date,
+        description: t.description,
+        amount: t.amount,
+        drCr: t.drCr,
+        sourceParser: t.sourceParser,
+        currency: t.currency,
+        category: t.category,
+        confidence: t.confidence,
+    }));
 }
 
 function monthKey(dateIso: string): string | null {
@@ -642,6 +622,7 @@ export async function POST(req: Request) {
                 const text = await extractPdfText(doc, doc.numPages);
                 const extractedTextChars = text.length;
                 let txns = parseTransactionsFromText(text);
+                const parserUsed = txns[0]?.sourceParser ?? "none";
 
                 // Heuristic: if very little text, likely scanned => needs OCR pipeline
                 const looksScanned = extractedTextChars < 50;
@@ -666,7 +647,7 @@ export async function POST(req: Request) {
                           ? `Scanned/ image-based PDF detected. OCR fallback processed ${Math.min(doc.numPages, 5)} pages.`
                           : "Scanned/ image-based PDF detected. Configure GOOGLE_VISION_API_KEY to enable OCR fallback."
                         : txns.length > 0
-                          ? `Text PDF detected. Parsed ${txns.length} transactions.`
+                          ? `Text PDF detected. Parsed ${txns.length} transactions using parser ${parserUsed}.`
                           : ocrChars > 0
                             ? "Text layer parsing failed; OCR fallback attempted."
                             : "Text PDF detected but no transaction rows were matched. Statement format rules need tuning.",

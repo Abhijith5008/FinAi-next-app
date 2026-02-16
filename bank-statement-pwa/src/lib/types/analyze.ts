@@ -6,6 +6,7 @@ export type Txn = {
   description: string;
   amount: number;
   drCr?: "CR" | "DR";
+  sourceParser?: string;
   currency: string;
   category: string;
   confidence: number;

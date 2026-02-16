@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import Script from "next/script";
 
@@ -6,12 +6,15 @@ export const metadata: Metadata = {
   title: "Statement Analyzer",
   description: "Analyze bank statements with OCR only when needed",
   manifest: "/manifest.webmanifest",
-  themeColor: "#0b1220",
   icons: {
     icon: "/icons/icon.jpg",
     apple: "/icons/icon.jpg",
     shortcut: "/icons/icon.jpg",
   },
+};
+
+export const viewport: Viewport = {
+  themeColor: "#0b1220",
 };
 
 export default function RootLayout({

@@ -1,0 +1,16 @@
+{
+    "name": "Statement Analyzer",
+    "short_name": "Analyzer",
+    "start_url": "/",
+    "display": "standalone",
+    "background_color": "#0b1220",
+    "theme_color": "#0b1220",
+    "icons": [
+        {
+            "src": "/icons/icon.jpg",
+            "sizes": "1500x1600",
+            "type": "image/jpeg",
+            "purpose": "any"
+        }
+    ]
+}

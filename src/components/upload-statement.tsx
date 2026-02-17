@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Modal from "@/components/modal";
 import type { AnalyzeResponse } from "@/lib/types/analyze";
@@ -9,11 +9,20 @@ const ANALYSIS_STORAGE_KEY = "statement_analysis_result_v1";
 
 export default function UploadStatement() {
   const router = useRouter();
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [passwordModalOpen, setPasswordModalOpen] = useState(false);
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [dragActive, setDragActive] = useState(false);
+
+  const handleFileSelect = (f: File | null) => {
+    setFile(f);
+    setPassword("");
+    setError("");
+    setPasswordModalOpen(false);
+  };
 
   const fileLabel = useMemo(() => {
     if (!file) return "No file selected";
@@ -22,11 +31,20 @@ export default function UploadStatement() {
 
   const resetAll = () => {
     setFile(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
     setPassword("");
     setBusy(false);
     setError("");
     setPasswordModalOpen(false);
   };
+
+  useEffect(() => {
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) resetAll();
+    };
+    window.addEventListener("pageshow", onPageShow);
+    return () => window.removeEventListener("pageshow", onPageShow);
+  }, []);
 
   async function runAnalyze(opts?: { password?: string }) {
     if (!file) return;
@@ -87,16 +105,64 @@ export default function UploadStatement() {
     <section className="rounded-xl border border-slate-800 bg-slate-900/40 p-5 space-y-4">
       <div className="space-y-2">
         <label className="block text-sm text-slate-300">Upload statement</label>
+        <label
+          htmlFor="statement-file-input"
+          className={`flex cursor-pointer items-center gap-3 rounded-lg border border-dashed px-4 py-4 text-sm transition ${dragActive
+              ? "border-emerald-400 bg-emerald-500/10 text-emerald-200"
+              : "border-slate-600 bg-slate-950/60 text-slate-300 hover:border-slate-400"
+            }`}
+          onDragEnter={(e) => {
+            e.preventDefault();
+            setDragActive(true);
+          }}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragActive(true);
+          }}
+          onDragLeave={(e) => {
+            e.preventDefault();
+            setDragActive(false);
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragActive(false);
+            const dropped = e.dataTransfer.files?.[0] ?? null;
+            handleFileSelect(dropped);
+          }}
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            className="h-5 w-5 shrink-0"
+            aria-hidden="true"
+            width={30}
+            height={30}
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.2-9.2a4 4 0 1 1 5.66 5.66l-9.2 9.2a2 2 0 0 1-2.83-2.83l8.49-8.48"
+            />
+          </svg>
+          <span>
+            Drag and drop a file here, or click to browse
+            <span className="block text-xs text-slate-400">
+              PDF, PNG, JPG, JPEG, CSV
+            </span>
+          </span>
+        </label>
         <input
+          id="statement-file-input"
+          ref={fileInputRef}
           type="file"
           accept=".pdf,.png,.jpg,.jpeg,.csv"
-          className="block w-full text-sm"
+          className="sr-only"
           onChange={(e) => {
             const f = e.target.files?.[0] ?? null;
-            setFile(f);
-            setPassword("");
-            setError("");
-            setPasswordModalOpen(false);
+            handleFileSelect(f);
           }}
         />
         <p className="text-xs text-slate-400">{fileLabel}</p>

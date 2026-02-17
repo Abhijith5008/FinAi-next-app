@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import AnalysisDashboard from "@/components/analysis-dashboard";
 import type { AnalyzeOk } from "@/lib/types/analyze";
@@ -10,19 +10,37 @@ const ANALYSIS_STORAGE_KEY = "statement_analysis_result_v1";
 type StoredAnalysis = AnalyzeOk & { uploadedFileName?: string; uploadedAtIso?: string };
 
 export default function AnalysisPage() {
-  const [data] = useState<StoredAnalysis | null>(() => {
-    if (typeof window === "undefined") return null;
+  const [data, setData] = useState<StoredAnalysis | null>(null);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
     try {
       const raw =
         sessionStorage.getItem(ANALYSIS_STORAGE_KEY) ??
         localStorage.getItem(ANALYSIS_STORAGE_KEY);
-      if (!raw) return null;
+      if (!raw) {
+        setData(null);
+        return;
+      }
       const parsed = JSON.parse(raw) as StoredAnalysis;
-      return parsed && parsed.ok ? parsed : null;
+      setData(parsed && parsed.ok ? parsed : null);
     } catch {
-      return null;
+      setData(null);
+    } finally {
+      setReady(true);
     }
-  });
+  }, []);
+
+  if (!ready) {
+    return (
+      <main className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-6">
+        <div className="w-full max-w-lg rounded-xl border border-slate-800 bg-slate-900/50 p-6 space-y-3">
+          <h1 className="text-xl font-semibold">Loading analysis...</h1>
+          <p className="text-sm text-slate-300">Preparing local analysis data.</p>
+        </div>
+      </main>
+    );
+  }
 
   if (!data) {
     return (
